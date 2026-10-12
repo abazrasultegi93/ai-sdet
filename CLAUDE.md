@@ -1,137 +1,134 @@
-# Cyclops test automation framework
+# CLAUDE.md
 
-Playwright + TypeScript test framework for a crypto/stablecoin payment platform (acceptance, settlement,
-payouts, FX). The domain is regulated: correctness, data consistency and behaviour under failure matter
-more than speed of iteration.
+Test automation framework for a crypto/stablecoin payment platform (acceptance, settlement,
+payouts, FX). Regulated money movement: priority is **correctness, data consistency, behaviour
+under failure**, then everything else.
 
-System under test: TypeScript/Node.js services, React frontend, HTTP APIs, PostgreSQL, Redis, AWS, and
-several external vendors (KYC, AML, custody, banking/FX partners).
+The repo is infrastructure with no product tests. The task, the system under test and its
+contracts arrive at runtime. Nothing below assumes a specific endpoint, vendor or page:
+discover it from the input, then adapt.
 
-This repo is the **infrastructure** for tests, deliberately shipped without product tests. `tests/api` and
-`tests/ui` are empty; tests are generated on request on top of the framework.
+## Live state (imported, never copied here)
 
-## Role
+Read these instead of trusting any description of them. They are the source of truth for
+commands, parameters and available fixtures.
 
-Act as a senior SDET pairing with the repo owner. The owner's job is the test architecture: how cheap it is
-for a developer to write a test, how reliable the suite is, and where coverage is blind. QA engineers own
-which scenarios matter and release readiness — when proposing scenarios, list them as proposals to confirm,
-don't present them as the definitive set.
+- Scripts and dependencies: @package.json
+- Parameters and their defaults: @.env.example
+- Fixtures a test can request: @src/fixtures/index.ts
+- Layers (projects) and reporters: @playwright.config.ts
 
-## Commands
+When a script, variable or fixture is added, this file does not change. Edit this file only
+when a rule changes.
 
-| Command | Purpose |
+## Step 0 for every request: orient
+
+1. Classify the request into a mode (table below). If it spans several, run them in order.
+2. Identify the inputs you were given: prose, an OpenAPI/JSON sample, source code, a failing
+   test, a URL. Derive contracts from them; do not invent fields or endpoints. Anything you had
+   to guess is listed under "Assumptions" in the answer.
+3. Check what is reachable: is there a running API/UI/DB for `TEST_ENV`? If not, say so and use
+   the "no system available" path below rather than pretending tests passed.
+
+| Request looks like | Mode | Output |
+|---|---|---|
+| "review / what's wrong with / is this good" | **Review** | findings by risk, no rewrite until asked |
+| "how would you test / what should we cover" | **Design** | risk analysis + scenario table, then stop |
+| "write / add / generate tests" | **Implement** | Design first if no agreed scenarios, then code, then run |
+| "failing / flaky / slow" | **Diagnose** | reproduce, root cause, fix, proof |
+| "add support for / make it possible to" | **Extend** | framework change + self-check test |
+| "why / explain / compare" | **Explain** | short answer with trade-offs |
+
+Slash commands `/test-design`, `/implement-tests`, `/review-tests` are the parameterized
+entry points for the first three.
+
+## Modes
+
+**Design.** Restate the behaviour and what failure would cost. Select the risk triggers that
+apply (next section). Produce a table: scenario, layer, risk covered, tag, priority. Add what
+is deliberately out of scope and which framework pieces are missing. Scenarios are proposals:
+QA owns the final list, so stop for confirmation.
+
+**Implement.** Order: contract schema, factory, client method or fixture, then specs. Lowest
+layer that can prove the behaviour. Run typecheck and the new specs; report real output. Prove
+one test can fail by breaking its expectation once.
+
+**Review.** Findings most severe first, each with location, how it fails or lets a bug through,
+and the fix. Order of concern: wrong money or state; tests that cannot fail (missing `await`,
+status-only assertions, asserting the mock, swallowed errors, conditionals); flakiness (sleeps,
+shared data, order, time); missing failure paths; maintainability. End with what has no test
+at all.
+
+**Diagnose.** Reproduce first (`--repeat-each`, `--workers=1` vs parallel, trace). Name the
+race or dependency. Never fix by adding retries, sleeps or longer timeouts. A flaky test may be
+a real product race: say which one it is.
+
+**Extend.** One mechanism per concern; grow an existing fixture or client before adding a new
+one. Every new capability gets a self-check test that runs with no application.
+
+## Risk triggers (apply only those the input activates)
+
+| If the behaviour... | Then cover |
 |---|---|
-| `npm test` | All projects |
-| `npm run test:api` / `test:ui` / `test:selfcheck` | One project |
-| `npm run test:smoke` | Tests tagged `@smoke` |
-| `npx playwright test path/to.spec.ts -g "title"` | One file / one test |
-| `npm run typecheck` | `tsc --noEmit` (strict) |
+| moves or records value | ledger invariant (debits = credits, fee + net = gross); state verified by a second read or DB row, not only the response |
+| is a mutating call | idempotency: replay returns the original, same key + different body rejected, concurrent duplicates create one effect |
+| reads then writes a shared resource | concurrency: racing requests, double spend, lost update |
+| has statuses | allowed transitions, terminal states cannot be left, out-of-order events |
+| involves amounts or rates | precision per asset (6/8/18 decimals), rounding direction, zero/negative/max, dust |
+| calls an external party | timeout with unknown outcome, 5xx, malformed body, retry; system ends consistent and retryable |
+| receives webhooks | duplicate, replayed, out-of-order, bad signature |
+| is asynchronous | poll for the outcome with a timeout; assert no duplicate effect |
+| is multi-tenant or role-based | tenant A cannot see or act on tenant B; missing, expired, wrong-scope token |
+| is user-facing | one thin UI flow; reach the state through the API first |
 
-After any change run `npm run typecheck` and the affected tests, and report the real result.
+## Parameterization: nothing that varies is hardcoded
 
-Parameters come from the environment (see `.env.example`): `TEST_ENV` (`local`, `staging`), `BASE_URL`,
-`API_URL`, `VENDOR_MODE` (`mock`, `sandbox`). PowerShell: `$env:TEST_ENV='staging'; npm test`.
-
-## Layout
-
-```
-framework/
-  index.ts              single import surface: import { test, expect, ... } from '@fw'
-  config/env.ts         typed, validated environment config
-  fixtures/index.ts     test.extend: env, api, vendors, vendorServer, page (auto-mocked), option vendorPrefix
-  api/ApiClient.ts      typed HTTP client; never throws on non-2xx; idempotencyKey option
-  mocks/VendorSimulator.ts   stateful KYC/AML/custody logic, no transport
-  mocks/transports.ts   routeVendors (page.route) and startStubServer (real HTTP)
-  data/factories.ts     unique test data builders
-  utils/money.ts        decimal string -> bigint minor units
-  pages/BasePage.ts     page-object base
-tests/
-  selfcheck/            proves the framework works with no app running; keep green
-  api/                  API tests (no browser)
-  ui/                   browser tests
-```
-
-The vendor URLs, the `/vendor` prefix, the environment URLs and the simulator's endpoints are placeholders
-until the real contracts are known. Say so when it matters; never present them as Cyclops' real API.
-
-## Rules
-
-TypeScript
-- Strict typing. No `any`, no non-null `!`, no `@ts-ignore`. Untrusted JSON is `unknown` and narrowed with a
-  type guard. `ApiClient`'s `<T>` is a cast, not validation.
-- Import from `@fw` in tests. New framework code is exported through `framework/index.ts`.
-
-Playwright
-- Always import `test`/`expect` from `@fw`, never from `@playwright/test`, so fixtures apply.
-- Locators: `getByTestId` first, then `getByRole`/`getByLabel`. No CSS/XPath tied to markup.
-- Web-first assertions (`await expect(locator).toBeVisible()`). No `waitForTimeout`, no manual sleeps, no
-  `networkidle`. For eventual consistency use `expect.poll` or `expect(async () => ...).toPass()`.
-- Every promise awaited. No conditional logic or try/catch that can hide a failure.
-- Network mocking through fixtures (`vendors`), not ad-hoc `page.route` inside tests.
-- Setup and teardown live in fixtures, not `beforeEach`/`afterEach` chains. Worker scope only for
-  expensive, read-only resources.
-- Tests are independent and parallel-safe: no shared mutable state, no ordering, no `serial` unless justified
-  in a comment. Create data per test through factories with unique ids.
-- Prefer API setup over UI setup: reach the state under test through `api`, then test one thing in the UI.
-- Page objects hold locators and actions; assertions stay in the test.
-- Data-driven cases: a typed `ReadonlyArray` of cases and a `for` loop generating one `test` per case.
-- Tags: `{ tag: '@smoke' }` for the merge gate; add others (`@regression`, `@slow`) only when used by CI.
-
-Fintech invariants (apply to every money-moving flow)
-- Money is a decimal string or `bigint` minor units. Never `number`, never `toBeCloseTo`.
-- Every mutating call carries an idempotency key. Cover: replay with same key returns the original result,
-  same key with a different payload is rejected, concurrent duplicates create exactly one side effect.
-- Assert side effects, not only responses: count what the vendor received (`vendors.createdTransfers`,
-  `vendors.requests(...)`), and verify state through a second read.
-- Cover the failure paths: vendor 5xx, timeout / unknown outcome, retry, partial failure, duplicate and
-  out-of-order webhooks, rejected KYC, high AML risk.
-- State machines: assert allowed transitions and that terminal states cannot be left.
-- No real secrets, keys, PII or mainnet addresses in code, fixtures or logs.
-
-## Vendor mocking
-
-`VendorSimulator` is one stateful instance per test. Tests arrange it (`setKycStatus`, `setAmlRisk`,
-`setTransferStatus`, `failNextTransfers`) and assert on it (`createdTransfers`, `requests`).
-
-- UI tests: the `page` fixture routes `${vendorPrefix}/**` to the simulator when `env.vendorMode === 'mock'`.
-- Backend/API tests: request the `vendorServer` fixture and point the service at `vendorServer.url`.
-  `page.route` cannot see server-to-server calls.
-
-To add a vendor or endpoint: extend `VendorSimulator.handle` with typed request/response shapes and state
-setters, add a selfcheck test, export new types from `framework/index.ts`. Do not add a second mock mechanism.
-
-## Extension points (build on request, in these places)
-
-| Asked for | Where / how |
+| Axis | Mechanism |
 |---|---|
-| API resource client (payments, payouts, FX quotes) | `framework/api/<Resource>Api.ts` composing `ApiClient`; expose as a fixture |
-| Auth / roles | worker-scoped fixture that logs in by API and saves `storageState`; `test.use({ role })` option |
-| PostgreSQL assertions or seeding | `framework/db/` with `pg`; worker-scoped pool fixture, test-scoped cleanup by unique id; read-only checks preferred |
-| Redis (locks, idempotency cache, rate limits) | `framework/redis/` with `ioredis`; key prefix per test |
-| Webhooks from vendors | signed-payload builder in `framework/mocks/webhooks.ts`; simulator method that emits to the app; cover duplicate, replayed, out-of-order, bad signature |
-| New vendor (banking, FX rates, chain node) | extend `VendorSimulator` |
-| Page object | `framework/pages/<Name>Page.ts` extending `BasePage`; expose as fixture |
-| Response schema / contract checks | `zod` schemas in `framework/api/schemas/`; parse instead of casting |
-| Fault injection (latency, timeouts, flaky N-of-M) | generalise `failNextTransfers` in the simulator |
-| CI changes (sharding, merge gate vs nightly) | `.github/workflows/tests.yml`, Playwright `--shard`, blob reporter |
-| Lint | ESLint with `typescript-eslint` + `eslint-plugin-playwright` (`no-floating-promises`, `no-wait-for-timeout`) |
+| Environment / target URLs / credentials | `TEST_ENV` + `src/config/env.ts` (zod schema). New variable: schema + `.env.example` |
+| Layer | Playwright project (`--project`) |
+| Subset | tags (`@smoke`, `@critical`, `@slow`) + `--grep` |
+| Input variations of one rule | typed case table + `for (const c of cases) test(...)` |
+| Per-test entities | factories with `uniqueId`; override only the fields the test is about |
+| Role, tenant, asset, vendor behaviour | fixture option set with `test.use({ ... })`, default in the fixture |
+| Scale | `WORKERS`, `--shard`, `--repeat-each` |
 
-Adding a dependency is fine when the table calls for it; say which one and why before installing.
+If a test needs a literal URL, id, token, amount precision or role name, that is a missing
+parameter: add the axis, do not inline the value.
 
-## Reviewing code or tests
+## No system available
 
-When asked to review, report findings ordered by risk, each with location, why it matters, and the fix:
-1. Correctness of money and state: floats, rounding, missing idempotency, double side effects, races.
-2. Things that let a broken system pass: missing `await`, assertions on mocks only, swallowed errors,
-   conditionals, assertions that cannot fail.
-3. Flakiness: sleeps, shared data, order dependence, time/timezone dependence, unmocked third parties.
-4. Missing failure paths and boundaries.
-5. Maintainability: brittle selectors, duplication that belongs in a fixture, `any`, unclear names.
-Then say what is not covered at all.
+When the task describes a system that is not running locally (common for a spec or a code
+snippet), do not stop at design:
 
-## Working style
+1. Encode the described contract as zod schemas.
+2. Build a minimal in-process stub (`node:http`, under `src/stubs/`) that implements the
+   contract with the state needed for the scenarios, exposed as a fixture that returns its URL.
+3. Run the tests against it and state clearly that they prove the tests and the contract
+   reading, not the real service.
 
-- State assumptions in one or two lines, then build. Ask only when a wrong guess would waste real time.
-- Small, reviewable steps. Match the existing code style. Keep explanations short unless asked.
-- Generated tests must be able to fail: check that each assertion would catch the bug it targets.
-- Don't weaken or delete a failing test to make the suite green; report the failure and its cause.
+## Fixed rules
+
+- Import `test`, `expect`, `expectJson` from `@fixtures`, never from `@playwright/test`.
+- One behaviour per test; the title states the rule. No branching, loops or try/catch in a
+  test body.
+- No `waitForTimeout`, sleeps or `networkidle`. Use `expect.poll` / `toPass` with a timeout.
+- Money is a decimal string or bigint minor units (`toMinorUnits`). Never `number`,
+  `parseFloat`, `toBeCloseTo`.
+- Untrusted JSON is `unknown` until parsed by a schema. No `any`, no `@ts-ignore`.
+- Tests are independent and parallel-safe; data is created per test.
+- UI locators: `getByRole`, `getByLabel`, `getByTestId`.
+- No secrets, PII or real addresses in code or logs. Never target production.
+- Do not weaken or delete an assertion to get green. Report the failure and its cause.
+- New dependency: say which and why before installing.
+
+## Answer format
+
+Assumptions (if any), what was done, real command output, what is not covered, open questions.
+Keep it short; the reader is watching live.
+
+## Gotchas
+
+- Playwright joins paths to `baseURL` like a browser: a leading `/` drops the base path prefix.
+- `db` and `redis` are lazy, worker-scoped; requesting one opens the connection.
+- PowerShell: `$env:TEST_ENV='staging'; npm run test:api`.
